@@ -1,0 +1,248 @@
+import express from "express"
+import FollowUp from "../models/FollowUp.js"
+import Lead from "../models/Lead.js"
+import Activity from "../models/Activity.js"
+
+const router = express.Router()
+
+// Get all follow-ups for a lead
+router.get("/lead/:leadId", async (req, res) => {
+  try {
+    const followUps = await FollowUp.find({ leadId: req.params.leadId })
+      .sort({ scheduledFor: -1 })
+      .populate("createdBy", "name email")
+
+    const formatted = followUps.map((fu) => ({
+      id: fu._id.toString(),
+      leadId: fu.leadId.toString(),
+      scheduledFor: fu.scheduledFor,
+      reason: fu.reason,
+      status: fu.status,
+      type: fu.type,
+      notes: fu.notes,
+      createdBy: fu.createdBy?.toString(),
+      createdByName: fu.createdByName,
+      completedAt: fu.completedAt,
+      completedNotes: fu.completedNotes,
+      reminderSent: fu.reminderSent,
+      outcome: fu.outcome,
+      createdAt: fu.createdAt,
+      updatedAt: fu.updatedAt,
+    }))
+
+    res.json(formatted)
+  } catch (error) {
+    console.error("[v0] Error fetching follow-ups:", error)
+    res.status(500).json({ message: "Error fetching follow-ups", error: error.message })
+  }
+})
+
+// Get pending follow-ups (for dashboard)
+router.get("/pending/dashboard", async (req, res) => {
+  try {
+    const now = new Date()
+    const pendingFollowUps = await FollowUp.find({
+      status: "pending",
+      scheduledFor: { $lte: now },
+    })
+      .populate("leadId", "name phone email")
+      .sort({ scheduledFor: 1 })
+
+    const formatted = pendingFollowUps.map((fu) => ({
+      id: fu._id.toString(),
+      leadId: fu.leadId._id.toString(),
+      leadName: fu.leadId.name,
+      leadPhone: fu.leadId.phone,
+      scheduledFor: fu.scheduledFor,
+      reason: fu.reason,
+      type: fu.type,
+      notes: fu.notes,
+    }))
+
+    res.json(formatted)
+  } catch (error) {
+    console.error("[v0] Error fetching pending follow-ups:", error)
+    res.status(500).json({ message: "Error fetching pending follow-ups", error: error.message })
+  }
+})
+
+// Create new follow-up
+router.post("/", async (req, res) => {
+  try {
+    const { leadId, scheduledFor, reason, type, notes, createdByName } = req.body
+
+    if (!leadId || !scheduledFor) {
+      return res.status(400).json({ message: "Missing required fields: leadId and scheduledFor" })
+    }
+
+    // Validate lead exists
+    const lead = await Lead.findById(leadId)
+    if (!lead) {
+      console.error("[v0] Lead not found:", leadId)
+      return res.status(404).json({ message: "Lead not found" })
+    }
+
+    const scheduledDate = new Date(scheduledFor)
+    if (isNaN(scheduledDate.getTime())) {
+      return res.status(400).json({ message: "Invalid date format for scheduledFor" })
+    }
+
+    // Create follow-up
+    const followUp = new FollowUp({
+      leadId,
+      scheduledFor: scheduledDate,
+      reason: reason || "custom",
+      type: type || "call",
+      notes: notes || "",
+      createdByName: createdByName || "System",
+    })
+
+    await followUp.save()
+
+    // Update lead with next follow-up date
+    await Lead.findByIdAndUpdate(leadId, {
+      nextFollowUp: scheduledDate,
+      followUpReason: reason || "custom",
+    })
+
+    // Create activity
+    const activity = new Activity({
+      leadId,
+      type: "follow_up_scheduled",
+      description: `Follow-up scheduled for ${scheduledDate.toLocaleString()} - Reason: ${reason || "custom"}`,
+      userName: createdByName || "System",
+    })
+    await activity.save()
+
+    res.status(201).json({
+      id: followUp._id.toString(),
+      leadId: followUp.leadId.toString(),
+      scheduledFor: followUp.scheduledFor,
+      reason: followUp.reason,
+      status: followUp.status,
+      type: followUp.type,
+      notes: followUp.notes,
+      createdByName: followUp.createdByName,
+      createdAt: followUp.createdAt,
+      updatedAt: followUp.updatedAt,
+    })
+  } catch (error) {
+    console.error("[v0] Error creating follow-up:", error)
+    res.status(500).json({ message: "Error creating follow-up", error: error.message, stack: error.stack })
+  }
+})
+
+// Mark follow-up as completed
+router.put("/:id/complete", async (req, res) => {
+  try {
+    const { outcome, completedNotes } = req.body
+
+    const followUp = await FollowUp.findByIdAndUpdate(
+      req.params.id,
+      {
+        status: "completed",
+        completedAt: new Date(),
+        completedNotes,
+        outcome,
+      },
+      { new: true },
+    )
+
+    if (!followUp) {
+      return res.status(404).json({ message: "Follow-up not found" })
+    }
+
+    // Create activity
+    const activity = new Activity({
+      leadId: followUp.leadId,
+      type: "follow_up_completed",
+      description: `Follow-up completed - Outcome: ${outcome}`,
+      userName: "System",
+    })
+    await activity.save()
+
+    res.json({
+      id: followUp._id.toString(),
+      leadId: followUp.leadId.toString(),
+      scheduledFor: followUp.scheduledFor,
+      reason: followUp.reason,
+      status: followUp.status,
+      type: followUp.type,
+      notes: followUp.notes,
+      createdByName: followUp.createdByName,
+      completedAt: followUp.completedAt,
+      completedNotes: followUp.completedNotes,
+      outcome: followUp.outcome,
+      createdAt: followUp.createdAt,
+      updatedAt: followUp.updatedAt,
+    })
+  } catch (error) {
+    console.error("[v0] Error completing follow-up:", error)
+    res.status(500).json({ message: "Error completing follow-up", error: error.message })
+  }
+})
+
+// Cancel follow-up
+router.put("/:id/cancel", async (req, res) => {
+  try {
+    const followUp = await FollowUp.findByIdAndUpdate(req.params.id, { status: "cancelled" }, { new: true })
+
+    if (!followUp) {
+      return res.status(404).json({ message: "Follow-up not found" })
+    }
+
+    res.json({
+      id: followUp._id.toString(),
+      leadId: followUp.leadId.toString(),
+      scheduledFor: followUp.scheduledFor,
+      reason: followUp.reason,
+      status: followUp.status,
+      type: followUp.type,
+      notes: followUp.notes,
+      createdByName: followUp.createdByName,
+      createdAt: followUp.createdAt,
+      updatedAt: followUp.updatedAt,
+    })
+  } catch (error) {
+    console.error("[v0] Error cancelling follow-up:", error)
+    res.status(500).json({ message: "Error cancelling follow-up", error: error.message })
+  }
+})
+
+// Mark reminder as sent
+router.put("/:id/remind", async (req, res) => {
+  try {
+    const followUp = await FollowUp.findByIdAndUpdate(
+      req.params.id,
+      {
+        reminderSent: true,
+        reminderSentAt: new Date(),
+      },
+      { new: true },
+    )
+
+    if (!followUp) {
+      return res.status(404).json({ message: "Follow-up not found" })
+    }
+
+    res.json({
+      id: followUp._id.toString(),
+      leadId: followUp.leadId.toString(),
+      scheduledFor: followUp.scheduledFor,
+      reason: followUp.reason,
+      status: followUp.status,
+      type: followUp.type,
+      notes: followUp.notes,
+      createdByName: followUp.createdByName,
+      reminderSent: followUp.reminderSent,
+      reminderSentAt: followUp.reminderSentAt,
+      createdAt: followUp.createdAt,
+      updatedAt: followUp.updatedAt,
+    })
+  } catch (error) {
+    console.error("[v0] Error sending reminder:", error)
+    res.status(500).json({ message: "Error sending reminder", error: error.message })
+  }
+})
+
+export default router
